@@ -45,3 +45,4 @@ vignettes/*.pdf
 
 # renv directory
 renv/*
+renv.lock
