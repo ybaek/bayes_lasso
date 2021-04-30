@@ -1,0 +1,236 @@
+---
+title: "Bayesian Generalized Lasso"
+author: "Youngsoo Baek"
+date: "\\today"
+output: pdf_document
+---
+
+# Simulated Data
+We first simulate some data. We simulate a latent time series that is sparse and has a few change points.
+```{r sim1}
+N <- 30 # no. of time points
+K <- 4 # no. of "patches"
+true_beta <- numeric(N)
+weight_nz <- .4 # non-zero weight
+prob_patch <- rep(c(.5 - .5 * weight_nz, .5 * weight_nz), 2)
+coin <- sample(seq(0, K - 1), N, replace = TRUE, prob = prob_patch)
+coin <- sort(coin)
+for (i in seq(N)) {
+    true_beta[i] <- (-1)^(coin[i] %/% 2) * 6 * (coin[i] %% 2)
+}
+true_sigma <- 2
+y <- true_beta + true_sigma * rnorm(N) # noisy observation
+plot(y, pch = 19)
+lines(true_beta)
+```
+
+# Sampling from the posterior
+We will assume the following generative model, suggested in Kyung et al. (2010) as a ``Bayesian version'' of the fused lasso penalty of Tibshirani et al. (2005):
+
+$$
+\begin{aligned}
+y_i|\beta,\sigma &\stackrel{iid}{\sim} N(\beta_i,\sigma^2),\; i = 1,\ldots,n.\\
+\beta|\sigma,\tau,\omega &\sim N_n(0,\sigma^2\Sigma_\beta).\\
+\Sigma_\beta^{-1} &:= T{-1} + D^T\Omega^{-1}D.\\
+\tau_1^2,\ldots,\tau_n^2 &\stackrel{iid}{\sim} Exp(\lambda_1).\\
+\omega_1^2,\ldots,\omega_{n-1}^2 &\stackrel{iid}{\sim} Exp(\lambda_2).\\
+p(\sigma^{-2}) &\propto 1/\sigma^2.
+\end{aligned}
+$$
+
+Here, $D$ is an $(n-1)\times n$-dimensional signed graph incidence matrix, i.e., $(D)_{ij} = -1$ if $i = j$, 1 if $i = j - 1$, and zero otherwise.
+$T$ and $\Omega$ are each $n\times n$ and $(n-1)\times(n-1)$ diagonal matrices consisting of $\{\tau_j^{-2}\}$ and $\{\omega_j^{-2}\}$, respectively.
+By a ``Bayesian version'' we (and the authors) mean the following: the mode of the posterior when we place the above priors is equivalent to a fused lasso
+estimator, with penalty parameters $\lambda_1$ and $\lambda_2$. 
+
+The authors state that a Gibbs sampler can be implemented to sample from the respective conditional posteriors of the parameters, as follows:
+$$
+\begin{aligned}
+\beta|\sigma^2,\{\tau_i^2\},\{\omega_i^2\},y &\sim N_n((I + \Sigma_\beta^{-1})^{-1}y, \sigma^2(I + \Sigma_\beta^{-1})^{-1}).\\
+1/\tau_i^2|\beta,\sigma^2,\{\omega_i^2\},y &\stackrel{iid}{\sim} InvGauss(\sqrt{\lambda_1^2\sigma^2/\beta_i^2},\lambda_1^2).\\
+1/\omega_i^2|\beta,\sigma^2,\{\tau_i^2\},y &\stackrel{iid}{\sim} InvGauss(\sqrt{\lambda_2^2\sigma^2/(\beta_{i+1} - \beta_i)^2},\lambda_2^2).\\
+\sigma^{-2}|\beta,\{\tau_i^2\},\{\omega_i^2\},y &\sim Gamma(n/2, (||y - \beta||^2 + \beta^T\Sigma_\beta^{-1}\beta)/2)
+\end{aligned}
+$$
+Actually this is the wrong derivation; one cannot factorize the conditional posteriors of parameter blocks $\{\tau_i^2\}$ and $\{\omega_i^2\}$ so easily,
+due to the determinant of the precision matrix involved in the conditional prior of $\beta$. The details on the incorrectness of the full conditionals later.
+Nevertheless, what equilibrium distribution are we then converging to, if we are at all?
+
+## Inverse Gaussian random variate generator
+First we need to be able to sample from an inverse Gaussian distribution. Though not provided in the `stats` package, this sampler can be implemented as
+a deterministic function of the RNGs we already have.
+```{r invGauss}
+rInvGauss <- function(mu, lam) {
+    lam2  <- 2 * lam
+    nu_sq <- rnorm(1)^2 # ~ chisq(df = 1)
+    ## Smaller root to the quadratic equation
+    root1 <- mu + mu^2 * nu_sq / lam2 -
+             mu / lam2 * sqrt(2 * mu * lam2 * nu_sq + mu^2 * nu_sq^2)
+    aux <- runif(1)
+    if (aux <= mu / (mu + root1)) return(root1)
+    else return(mu^2 / root1) # Larger root by that prob.
+}
+```
+
+## Gibbs sampler
+Let us now simulate from the ``posterior'' using the proposed Gibbs sampler.
+We choose hyperparameters $\lambda_1 = \lambda_2 = 2$.
+```{r gibbs}
+hyper1 <- hyper2 <- 2
+## (with large graphs this code is never encouraged)
+D <- matrix(0, N - 1, N)
+for (i in seq(N - 1)) {
+    for (j in seq(N)) {
+        if (i == j) D[i, j] <- -1
+        else if (j - i == 1) D[i, j] <- 1
+    }
+}
+## (sample 10,000 variables)
+S <- 10000
+beta <- tau2inv <- matrix(0, S, N)
+omega2inv <- matrix(0, S, N - 1)
+sig2inv <- numeric(S)
+## (In practice a good initial pt will be the posterior mode
+##  a.k.a. fused lasso estimator.
+##  Req. a constrained L1 opt., but we don't really need an accurate soln.)
+beta_curr <- y - rnorm(N)
+sig2inv_curr <- 1 / var(y)
+tau2inv_curr <- 1 / (var(beta_curr) + rexp(N))
+omega2inv_curr <- 1 / (c(var(D %*% beta_curr)) + rexp(N - 1))
+#########
+for (s in 1:S) {
+    ## 1. Sampling tau's & omega's
+    for (n in seq(N - 1)) {
+        tau2inv_curr[n] <- rInvGauss(
+            sqrt(hyper1^2 * sig2inv_curr^-1 / beta_curr[n]^2),
+            hyper1^2
+        )
+        omega2inv_curr[n] <- rInvGauss(
+            sqrt(
+                hyper2^2 * sig2inv_curr^-1 / (beta_curr[n + 1] - beta_curr[n])^2
+            ),
+            hyper2^2
+        )
+    }
+    tau2inv_curr[N] <- rInvGauss(
+        sqrt(hyper1^2 * sig2inv_curr^-1 / beta_curr[N]^2), hyper1^2
+    )
+    tau2inv[s, ] <- tau2inv_curr
+    omega2inv[s, ] <- omega2inv_curr
+    ## 2. Sampling beta
+    pprec <- t(D) %*% diag(omega2inv_curr) %*% D
+    diag(pprec) <- diag(pprec) + (tau2inv_curr + 1)
+    pprec_fac <- chol(pprec)
+    beta[s, ] <- beta_curr <-
+        backsolve(pprec_fac,
+        forwardsolve(t(pprec_fac), y) + sig2inv_curr^-.5 * rnorm(N))
+    ## 3. Sampling sigma
+    sse <- sum((y - beta_curr)^2)
+    prior_sse <- c(beta_curr %*% (pprec %*% beta_curr))
+    sig2inv[s] <- sig2inv_curr <-
+        1 / rgamma(1, .5 * N, .5 * (sse + prior_sse))
+}
+```
+
+What is the posterior mean of $\beta$?
+```{r posterior}
+plot(y, pch = 19)
+points(colMeans(beta), pch = 19, col = 2)
+lines(true_beta)
+legend("topright",
+       legend = c("Data", "Estimated mean"),
+       col = c(1, 2),
+       pch = 19, cex = .9)
+mean(sig2inv^-.5) # standard deviation
+```
+
+So even though we are not sampling from the true posterior, there exists an equilibrium distribution, and in the human eye nothing looks obviously wrong.
+The inference is ineffective in the sense that there is almost no shrinkage when compared with the data. Conseqeuently we also underestimate $\sigma$.
+We cannot be sure at this point, however, whether this is a flaw inherent to the model, or because our equilibrium distribution is a wrong one.
+
+## How far are we off from the true posterior?
+We can treat Stan as a black box here that allows us to sample from the true posterior, and use the sample draws to see how far we are off.
+```{r stan}
+library(rstan)
+rstan_options(auto_write = TRUE)
+model <- "
+  data {
+      int<lower=2> N;
+      matrix[N-1,N] D;
+      vector[N] y;
+  }
+  transformed data {
+      vector[N] zeros = rep_vector(0, N);
+  }
+  parameters {
+      vector[N] beta;
+      vector<lower=0>[N] tau2inv;
+      vector<lower=0>[N-1] omega2inv;
+      real<lower=0> sig2inv;
+  }
+  transformed parameters {
+      matrix[N,N] pseudo_lap = D' * diag_pre_multiply(omega2inv, D);
+      matrix[N,N] pprec = add_diag(pseudo_lap, tau2inv);
+  }
+  model {
+      sig2inv ~ chi_square(.001);
+      tau2inv ~ inv_gamma(1., 1.);
+      omega2inv ~ inv_gamma(1., 1.);
+      beta ~ multi_normal_prec(zeros, sig2inv * pprec);
+      y ~ normal(beta, pow(sig2inv, -0.5));
+  }
+"
+fit <- stan(model_code = model,
+            data = list(N = length(y), y = y, D = D),
+            pars = c("beta", "sig2inv", "tau2inv", "omega2inv"),
+            chains = 1, control = list(adapt_delta = .95))
+plot(y, pch = 19)
+points(colMeans(beta), pch = 19, col = 2)
+points(colMeans(extract(fit, "beta")$beta), pch = 19, col = 4)
+lines(true_beta)
+legend("topright",
+       legend = c("Data", "Estimate (Gibbs)", "Estimate (Stan)"),
+       col = c(1, 2, 4),
+       pch = 19, cex = .9)
+mean(extract(fit, "sig2inv")$sig2inv^-.5)
+```
+
+Something interesting is happening here. The sample draws from the true posterior are on average closer to the constant function.
+In particular, we are overshrinking the truly non-zero signals by quite a large amount, and we also overestimate $\sigma$ as a consequence.
+This is known to be a problem with many of the ``Bayesian implementations'' of Lasso procedure, using a Laplace prior.
+The posterior mean estimator from these models tend to overshrink the true signals, because the Laplace prior distribution tails are not thick enough. 
+The inference on $\beta$ and $\sigma$ turns out to be almost directly opposite to that we get from Gibbs sampler draws. The model is still flawed, but in a different way.
+
+# Why Previous Derviation was Incorrect
+We describe here briefly why we observe the discrepancy between the equilibrium distribution of the Gibbs sampler derived previously and the true posterior.
+The derivation of Kyung et al. (2010) uses the fact that a Laplace prior can be expressed as an exponentially driven scale mixture of Gaussians:
+$$
+\begin{aligned}
+\frac{\lambda_1}{2\sigma}e^{-\lambda_1|\beta_j|/\sigma} &=
+\int_0^\infty\frac{1}{\sqrt{2\pi\sigma^2\tau_j^2}}
+\exp\left(-\frac{\beta_j^2}{2\sigma^2\tau_j^2}\right)\times
+\frac{\lambda_1^2}{2}e^{-\lambda_1^2\tau_j^2/2}~d\tau_j^2,\\
+\frac{\lambda_2}{2\sigma}e^{-\lambda_1|\beta_{j+1}-\beta_j|/\sigma} &=
+\int_0^\infty\frac{1}{\sqrt{2\pi\sigma^2\omega_j^2}}
+\exp\left(-\frac{(\beta_{j+1} - \beta_j)^2}{2\sigma^2\tau_j^2}\right)\times
+\frac{\lambda_2^2}{2}e^{-\lambda_2^2\omega_j^2/2}~d\omega_j^2.
+\end{aligned}
+$$
+Combining the integrands of the two formulae and rearranging the terms yields a multivariate Gaussian density for $\beta$ with 
+precision matrix $\Sigma_\beta^{-1}$, defined above. The authors then directly proceed to stating the inverse Gaussian full conditionals
+for $\{\tau_j^{-2}\}$ and $\{\omega_j^{-2}\}$ without further proof, per the arguments of Park and Casella (2008). What differs in this particular setup, however,
+is that $\Sigma_\beta^{-1}$ is no longer a diagonal matrix; if it were, the arguments would have been correct. Note that the prior of $\beta$ conditional on the scale parameters is the following multivariate Gaussian:
+$$
+\begin{aligned}
+p(\beta|\{\tau_j\},\{\omega_j\},\sigma) &= \frac{1}{(2\pi)^{n/2}|\Sigma_\beta^{-1}|^{1/2}}\exp\left(-\frac{1}{2}\beta^T\Sigma_\beta^{-1}\beta\right)\\
+|\Sigma_\beta^{-1}| &= |\Lambda_1^{-1} + D^T\Lambda_2^{-1}D|.
+\end{aligned}
+$$
+This determinant of a sum of two matrices does not factor nicely into a product of $\tau_j$'s and $\omega_j$'s. So we cannot say, conditional on all else, that each pair $(\tau_j,\omega_j)$ has independent full conditionals.
+Either, then, we must update all of them at once, which surely has an intractable full conditional, or one at a time, with a full conditional possibly also intractable.
+
+# What If We Tried a Different Model?
+Placing a scale mixture of normal prior on $\beta$ is a popular idea now in Bayesian sparse regression. A horseshoe prior of Carvalho, Polson, and Scott (2010)
+is known to achieve minimax rate of posterior concentration in this setup, when no graph structure is presumed. It is known to resolve the overshrinking
+phenomenon of Laplace priors by placing a Cauchy prior on the scale parameters (truncated at zero), which has very fat tails. So, maybe we can get a better posterior
+mean estimator by replacing exponential priors in the generative model above with a Cauchy prior.
